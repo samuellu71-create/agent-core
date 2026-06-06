@@ -91,7 +91,8 @@ export class LettaRuleSolverProvider implements RuleSolverProvider {
     }
 
     const callHistory = history ?? [];
-    const effectiveHistory = currentAction && !callHistory.includes(currentAction)
+    const lastHistoryAction = callHistory.at(-1);
+    const effectiveHistory = currentAction && lastHistoryAction !== currentAction
       ? [...callHistory, currentAction]
       : [...callHistory];
 
