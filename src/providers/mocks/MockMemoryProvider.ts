@@ -10,6 +10,10 @@ import type {
   MemorySearchParams,
 } from "../MemoryProvider.js";
 import type { ProviderStatus } from "../registry.js";
+import { getEmbedder, cosineSimilarity } from "../../embeddings/index.js";
+import { scoreAndRank, type ScoringCandidate } from "../../memory/hybridScorer.js";
+import { getStatsCollector } from "../../memory/retrievalStats.js";
+import { checkDuplicate, mergeIntoExisting } from "../../memory/deduplicator.js";
 
 interface MemoryRow {
   id: string;
@@ -22,6 +26,8 @@ interface MemoryRow {
   concepts: string;
   files_read: string;
   files_modified: string;
+  embedding: string | null;
+  active_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -36,7 +42,6 @@ export class MockMemoryProvider implements MemoryProvider {
 
   async write(params: MemoryWriteParams): Promise<MemoryRecord> {
     const db = getDb();
-    const id = uuidv4();
     const now = new Date().toISOString();
     const row = {
       kind: params.kind ?? "manual",
@@ -46,10 +51,36 @@ export class MockMemoryProvider implements MemoryProvider {
       files_modified: params.files_modified ?? [],
       metadata: params.metadata ?? {},
     };
+
+    // Deduplication check: if a near-duplicate exists in the same scope, merge
+    const dedup = await checkDuplicate(params.content, params.scope, params.scope_id);
+    if (dedup.isDuplicate && dedup.existingId) {
+      await mergeIntoExisting(
+        dedup.existingId,
+        params.content,
+        row.metadata,
+        row.facts,
+        row.concepts,
+        row.files_read,
+        row.files_modified,
+      );
+      // Bump active_count on merge
+      db.prepare(`UPDATE memories SET active_count = active_count + 1 WHERE id = ?`).run(
+        dedup.existingId,
+      );
+      const merged = await this.get(dedup.existingId);
+      if (merged) return merged;
+    }
+
+    // Compute embedding for the content
+    const id = uuidv4();
+    const embedder = getEmbedder();
+    const embedding = await embedder.embed(params.content);
+
     db.prepare(
       `INSERT INTO memories
-       (id, scope, scope_id, content, metadata, kind, facts, concepts, files_read, files_modified, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, scope, scope_id, content, metadata, kind, facts, concepts, files_read, files_modified, embedding, active_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
     ).run(
       id,
       params.scope,
@@ -61,6 +92,7 @@ export class MockMemoryProvider implements MemoryProvider {
       JSON.stringify(row.concepts),
       JSON.stringify(row.files_read),
       JSON.stringify(row.files_modified),
+      JSON.stringify(embedding),
       now,
       now,
     );
@@ -82,16 +114,110 @@ export class MockMemoryProvider implements MemoryProvider {
 
   async search(params: MemorySearchParams): Promise<MemorySearchResult[]> {
     const limit = params.top_k ?? 10;
-    const ftsQuery = buildFtsQuery(params.query);
-    const fetchLimit =
-      params.filters && Object.keys(params.filters).length > 0 ? Math.max(limit * 10, 100) : limit;
-    const rows = ftsQuery ? this.searchFts(params, ftsQuery, fetchLimit) : this.searchLike(params, fetchLimit);
     const threshold = params.threshold ?? 0;
-    return rows
-      .map((row) => this.toSearchResult(row))
-      .filter((result) => matchesMetadataFilters(result.metadata, params.filters ?? {}))
-      .filter((result) => result.score >= threshold)
-      .slice(0, limit);
+    const overFetch = Math.max(limit * 4, 60);
+
+    // Compute query embedding
+    const embedder = getEmbedder();
+    const queryEmbedding = await embedder.embed(params.query);
+
+    // Fetch candidates from DB (scope-filtered, over-fetch for scoring pool)
+    const candidates = this.fetchCandidates(params, overFetch);
+
+    // Build scoring candidates with all five signals
+    const scoringCandidates: ScoringCandidate[] = candidates
+      .filter((row) => matchesMetadataFilters(parseObject(row.metadata), params.filters ?? {}))
+      .map((row) => {
+        const record = toRecord(row);
+        const embedding = row.embedding ? (JSON.parse(row.embedding) as number[]) : null;
+        const vecScore = embedding ? Math.max(0, cosineSimilarity(queryEmbedding, embedding)) : 0;
+        return {
+          ...record,
+          active_count: row.active_count ?? 0,
+          vec_score: vecScore,
+          bm25_rank: row.rank ?? 0,
+        };
+      });
+
+    // Hybrid score and rank
+    const t0 = performance.now();
+    const scored = scoreAndRank(scoringCandidates, {
+      queryScope: params.scope,
+      threshold,
+      topK: limit,
+      explain: false,
+    });
+    const latencyMs = performance.now() - t0;
+
+    // Record retrieval stats
+    getStatsCollector().recordQuery({
+      resultCount: scored.length,
+      scores: scored.map((s) => s.score),
+      latencyMs,
+    });
+
+    // Bump active_count for returned memories
+    const db = getDb();
+    for (const s of scored) {
+      db.prepare(`UPDATE memories SET active_count = active_count + 1 WHERE id = ?`).run(s.id);
+    }
+
+    return scored.map((s) => ({
+      id: s.id,
+      content: s.content,
+      scope: s.scope,
+      kind: s.kind,
+      score: s.score,
+      metadata: s.metadata,
+      facts: s.facts,
+      concepts: s.concepts,
+      files_read: s.files_read,
+      files_modified: s.files_modified,
+    }));
+  }
+
+  /**
+   * Fetch candidate rows using FTS5 (if available) plus a vector-scan fallback.
+   * Deduplicates by id so candidates from both sources merge.
+   */
+  private fetchCandidates(params: MemorySearchParams, limit: number): MemorySearchRow[] {
+    const seen = new Map<string, MemorySearchRow>();
+
+    // FTS5 BM25 candidates
+    const ftsQuery = buildFtsQuery(params.query);
+    if (ftsQuery) {
+      for (const row of this.searchFts(params, ftsQuery, limit)) {
+        seen.set(row.id, row);
+      }
+    }
+
+    // All-rows fallback for vector scoring (scope-filtered)
+    for (const row of this.searchAll(params, limit)) {
+      if (!seen.has(row.id)) {
+        seen.set(row.id, row);
+      }
+    }
+
+    return Array.from(seen.values());
+  }
+
+  /**
+   * Fetch all scope-filtered rows (no text match required) for vector scoring.
+   */
+  private searchAll(params: MemorySearchParams, limit: number): MemorySearchRow[] {
+    const conditions: string[] = ["1=1"];
+    const values: unknown[] = [];
+    if (params.scope) {
+      conditions.push("scope = ?");
+      values.push(params.scope);
+    }
+    if (params.scope_id) {
+      conditions.push("scope_id = ?");
+      values.push(params.scope_id);
+    }
+    return getDb()
+      .prepare(`SELECT * FROM memories WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ?`)
+      .all(...values, limit) as MemorySearchRow[];
   }
 
   async get(id: string): Promise<MemoryRecord | null> {
@@ -171,21 +297,6 @@ export class MockMemoryProvider implements MemoryProvider {
       .all(...values, limit) as MemorySearchRow[];
   }
 
-  private toSearchResult(row: MemorySearchRow): MemorySearchResult {
-    const record = toRecord(row);
-    return {
-      id: record.id,
-      content: record.content,
-      scope: record.scope,
-      kind: record.kind,
-      score: scoreFromRank(row.rank),
-      metadata: record.metadata,
-      facts: record.facts,
-      concepts: record.concepts,
-      files_read: record.files_read,
-      files_modified: record.files_modified,
-    };
-  }
 }
 
 function toRecord(row: MemoryRow): MemoryRecord {
@@ -226,11 +337,6 @@ function buildFtsQuery(query: string): string {
       ?.map((token) => `${token.replace(/"/g, "")}*`)
       .join(" ") ?? ""
   );
-}
-
-function scoreFromRank(rank: number | undefined): number {
-  if (rank === undefined) return 1;
-  return 1 / (1 + Math.abs(rank));
 }
 
 function matchesMetadataFilters(metadata: Record<string, unknown>, filters: Record<string, unknown>): boolean {

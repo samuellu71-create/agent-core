@@ -27,6 +27,8 @@ function initSchema(db: Database.Database): void {
       concepts TEXT NOT NULL DEFAULT '[]',
       files_read TEXT NOT NULL DEFAULT '[]',
       files_modified TEXT NOT NULL DEFAULT '[]',
+      embedding TEXT,
+      active_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -119,6 +121,8 @@ function ensureMemoryColumns(db: Database.Database): void {
     ["concepts", "TEXT NOT NULL DEFAULT '[]'"],
     ["files_read", "TEXT NOT NULL DEFAULT '[]'"],
     ["files_modified", "TEXT NOT NULL DEFAULT '[]'"],
+    ["embedding", "TEXT"],
+    ["active_count", "INTEGER NOT NULL DEFAULT 0"],
   ];
   for (const [name, definition] of columns) {
     if (!existing.has(name)) {
