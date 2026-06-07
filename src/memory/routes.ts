@@ -7,7 +7,15 @@ import {
   MemoryPatchInput,
   MemoryExtractionResult,
 } from "../schemas/memory.js";
-import { isDeepSeekConfigured, DeepSeekClient, llmJson } from "../llm/index.js";
+import {
+  isDeepSeekConfigured,
+  DeepSeekClient,
+  isGeminiConfigured,
+  GeminiClient,
+  llmJson,
+} from "../llm/index.js";
+import type { LLMClient } from "../llm/index.js";
+import { getStatsCollector } from "./retrievalStats.js";
 import { getProvider } from "../providers/registry.js";
 
 export async function memoryRoutes(app: FastifyInstance): Promise<void> {
@@ -35,18 +43,23 @@ export async function memoryRoutes(app: FastifyInstance): Promise<void> {
   app.post("/memory/extract", async (req) => {
     const input = MemoryExtractInput.parse(req.body);
 
-    if (isDeepSeekConfigured() && process.env.ENABLE_LLM_EXTRACT === "true") {
-      const llmResult = await extractWithLLM(input.text);
-      if (llmResult) {
-        return { session_id: input.session_id, candidates: llmResult };
-      }
+    // Try LLM extraction with multi-provider fallback (Gemini → DeepSeek)
+    const llmResult = await extractWithLLM(input.text);
+    if (llmResult) {
+      return { session_id: input.session_id, candidates: llmResult, method: "llm" };
     }
 
+    // Fallback to keyword heuristic extraction
     const candidates = extractCandidates(input.text);
     return {
       session_id: input.session_id,
       candidates,
+      method: "keyword",
     };
+  });
+
+  app.get("/memory/stats", async () => {
+    return getStatsCollector().snapshot();
   });
 
   app.post("/memory/promote", async (req) => {
@@ -103,14 +116,7 @@ export async function memoryRoutes(app: FastifyInstance): Promise<void> {
   });
 }
 
-async function extractWithLLM(
-  text: string,
-): Promise<Array<{ content: string; confidence: number; scope?: string }> | null> {
-  const client = new DeepSeekClient();
-  const result = await llmJson(client, MemoryExtractionResult, [
-    {
-      role: "system",
-      content: `You are a memory extraction system for a software development agent platform.
+const EXTRACTION_SYSTEM_PROMPT = `You are a memory extraction system for a software development agent platform.
 Given text from a coding session, extract durable facts, conventions, patterns, and lessons worth remembering.
 
 Return valid JSON matching this schema:
@@ -129,8 +135,31 @@ Guidelines:
 - Confidence: 0.9+ for explicit rules ("always", "never", "must"), 0.6-0.8 for conventions, 0.3-0.5 for observations
 - Scope: "repo" for repo-specific facts, "user" for user preferences, "global_policy" for universal rules
 - Return at most 10 candidates, sorted by confidence descending
-- Skip trivial or ephemeral facts`,
-    },
+- Skip trivial or ephemeral facts`;
+
+/**
+ * Resolve the best available LLM client.
+ *
+ * Priority: Gemini → DeepSeek → null (fallback to keyword)
+ *
+ * Reference: mem0 uses GPT (OpenAI) for extraction.
+ *            cognee uses Instructor (OpenAI/Gemini/Anthropic) for entity extraction.
+ *            We support multi-provider with automatic fallback.
+ */
+function resolveExtractionClient(): LLMClient | null {
+  if (isGeminiConfigured()) return new GeminiClient();
+  if (isDeepSeekConfigured()) return new DeepSeekClient();
+  return null;
+}
+
+async function extractWithLLM(
+  text: string,
+): Promise<Array<{ content: string; confidence: number; scope?: string }> | null> {
+  const client = resolveExtractionClient();
+  if (!client) return null;
+
+  const result = await llmJson(client, MemoryExtractionResult, [
+    { role: "system", content: EXTRACTION_SYSTEM_PROMPT },
     { role: "user", content: text },
   ]);
 
